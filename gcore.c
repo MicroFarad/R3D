@@ -5,10 +5,239 @@ Copyright (C) 2015 Kyle Gagner
 All rights reserved
 */
 
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
 #include "gcore.h"
+
+int StringComparator(POLY_Polymorphic key1, POLY_Polymorphic key2)
+{
+	return strcmp(key1.ref, key2.ref);
+}
+
+int DescriptorCount(GCORE_ContainerDescriptor *descriptor)
+{
+	return AVL_Size(&descriptor->map);
+}
+
+void GCORE_BufferRelease(GCORE_Buffer *buffer)
+{
+	int flags = buffer->source->flags;
+	if(flags & GCORE_THREADED)
+	{
+		mtx_lock(&buffer->lock);
+		mtx_lock(&buffer->source->lock);
+	}
+	buffer->refcount--;
+	if(!buffer->refcount)
+	{
+		buffer->next = buffer->source->first;
+		buffer->source->first = buffer;
+	}
+	if(flags & GCORE_THREADED)
+	{
+		mtx_unlock(&buffer->lock);
+		mtx_unlock(&buffer->source->lock);
+	}
+}
+
+void GCORE_BufferReference(GCORE_Buffer *buffer, int increment)
+{
+	int flags = buffer->source->flags;
+	if(flags & GCORE_THREADED) mtx_lock(&buffer->lock);
+	buffer->refcount += increment;
+	if(flags & GCORE_THREADED) mtx_unlock(&buffer->lock);
+}
+
+void GCORE_BufferPoolInitialize(GCORE_BufferPool *pool, int buffersize, int initial, int flags)
+{
+	pool->buffersize = buffersize;
+	mtx_init(&pool->lock, mtx_plain);
+	cnd_init(&pool->block);
+	pool->first = NULL;
+	pool->flags = flags;
+	for(int n = 0; n < initial; n++)
+	{
+		GCORE_Buffer *buffer = malloc(sizeof(GCORE_Buffer));
+		buffer->contents = malloc(buffersize);
+		buffer->next = pool->first;
+		buffer->refcount = 1;
+		buffer->source = pool;
+		pool->first = buffer;
+		mtx_init(&buffer->lock, mtx_plain);
+	}
+}
+
+GCORE_Buffer *GCORE_BufferPoolAcquire(GCORE_BufferPool *pool)
+{
+	GCORE_Buffer *result;
+	int flags = pool->flags;
+	if(flags & GCORE_THREADED) mtx_lock(&pool->lock);
+	if(flags & GCORE_BLOCKING & ~GCORE_THREADED) while(!pool->first) cnd_wait(&pool->block, &pool->lock);
+	if(pool->first)
+	{
+		result = pool->first;
+		pool->first = pool->first->next;
+		result->refcount = 1;
+	}
+	else
+	{
+		result = malloc(sizeof(GCORE_Buffer));
+		result->content = malloc(pool->buffersize);
+		mtx_init(&result->lock, mtx_plain);
+		result->refcount = 1;
+		result->source = pool;
+	}
+	if(flags & GCORE_THREADED) mtx_unlock(&pool->lock);
+	return result;
+}
+
+void GCORE_BufferPoolClean(GCORE_BufferPool *pool)
+{
+	int flags = pool->flags;
+	if(flags & GCORE_THREADED) mtx_lock(&pool->lock);
+	GCORE_Buffer *buffer = pool->first;
+	while(buffer)
+	{
+		GCORE_Buffer *next = buffer->next;
+		free(buffer->content);
+		free(buffer);
+		buffer = next;
+	}
+	pool->first = NULL;
+	if(flags & GCORE_THREADED) mtx_unlock(&pool->lock);
+}
+
+void GCORE_ContainerDescriptorInitialize(GCORE_ContainerDescriptor *descriptor)
+{
+	AVL_Initialize(&descriptor->map, NULL, NULL, StringComparator);
+}
+
+void GCORE_ContainerDescriptorInsert(GCORE_ContainerDescriptor *descriptor, char *tag)
+{
+	AVL_Set(&descriptor->map, POLY_REF(tag), POLY_SINT32(AVL_Size(&descriptor->map)));
+}
+
+void GCORE_ContainerRelease(GCORE_Container *container)
+{
+	int flags = container->source->flags;
+	if(flags & GCORE_THREADED) mtx_lock(&container->lock);
+	container->refcount--;
+	if(!container->refcount)
+	{
+		for(int n = DescriptorCount(container->source->descriptor); n >= 0; n--) GCORE_BufferRelease(&container->buffers[n]);
+		container->next = container->source->first;
+		container->source->first = container;
+	}
+	if(flags & GCORE_THREADED) mtx_unlock(&container->lock);
+}
+
+void GCORE_ContainerReference(GCORE_Container *container, int increment)
+{
+	int flags = container->source->flags;
+	if(flags & GCORE_THREADED) mtx_lock(&container->lock);
+	container->refcount += increment;
+	if(flags & GCORE_THREADED) mtx_unlock(&container->lock);
+}
+
+void GCORE_ContainerPoolInitialize(GCORE_ContainerPool *pool, GCORE_Descriptor *descriptor, int initial, int flags)
+{
+	pool->descriptor = descriptor;
+	mtx_init(&pool->lock, mtx_plain);
+	cnd_init(&pool->block);
+	pool->first = NULL;
+	pool->flags = flags;
+	for(int n = 0; n < initial; n++)
+	{
+		GCORE_Container *container = malloc(sizeof(GCORE_Container));
+		container->buffers = malloc(DescriptorCount(pool->descriptor) * sizeof(GCORE_Buffer*));
+		container->next = pool->first;
+		container->refcount = 1;
+		container->source = pool;
+		pool->first = container;
+		mtx_init(&container->lock, mtx_plain);
+	}
+}
+
+GCORE_Container *GCORE_ContainerPoolAcquire(GCORE_ContainerPool *pool)
+{
+	GCORE_Container *result;
+	int flags = pool->flags;
+	if(flags & GCORE_THREADED) mtx_lock(&pool->lock);
+	if(flags & GCORE_BLOCKING & ~GCORE_THREADED) while(!pool->first) cnd_wait(&pool->block, &pool->lock);
+	if(pool->first)
+	{
+		result = pool->first;
+		pool->first = pool->first->next;
+		result->refcount = 1;
+	}
+	else
+	{
+		result = malloc(sizeof(GCORE_Container));
+		result->buffers = malloc(DescriptorCount(pool->descriptor) * sizeof(GCORE_Buffer*));
+		mtx_init(&result->lock, mtx_plain);
+		result->refcount = 1;
+		result->source = pool;
+	}
+	if(flags & GCORE_THREADED) mtx_unlock(&pool->lock);
+	return result;
+}
+
+void GCORE_ContainerPoolClean(GCORE_ContainerPool *pool)
+{
+	int flags = pool->flags;
+	if(flags & GCORE_THREADED) mtx_lock(&pool->lock);
+	GCORE_Container *container = pool->first;
+	while(container)
+	{
+		GCORE_Container *next = container->next;
+		free(container->buffers);
+		free(container);
+		container = next;
+	}
+	pool->first = NULL;
+	if(flags & GCORE_THREADED) mtx_unlock(&pool->lock);
+}
+
+void GCORE_ContainerQueueEnqueue(GCORE_ContainerQueue *queue, GCORE_Container *container)
+{
+	int flags = queue->flags;
+	if(flags & GCORE_THREADED) mtx_lock(&queue->lock);
+	LIST_InsertHead(&queue->queue, POLY_REF(container));
+	if(flags & GCORE_THREADED) mtx_unlock(&queue->lock);
+}
+
+GCORE_Container *GCORE_ContainerQueueDequeue(GCORE_ContainerQueue *queue)
+{
+	GCORE_Container *result;
+	int flags = queue->flags;
+	if(flags & GCORE_THREADED) mtx_lock(&queue->lock);
+	if(flags & GCORE_BLOCKING & ~GCORE_THREADED) while(!LIST_Size(&queue->queue)) cnd_wait(&queue->block, &queue->lock);
+	if(LIST_Size(&queue->queue)) result = (GCORE_Container*)LIST_TakeTail(&queue->queue).ref;
+	else result = NULL; // if this happens you fucked up pro'lly
+	if(flags & GCORE_THREADED) mtx_unlock(&queue->lock);
+	return result;
+}
+
+void GCORE_TagSubsetInitialize(GCORE_TagSubset *subset)
+{
+	AVL_Initialize(&subset->set, NULL, NULL, StringComparator);
+}
+
+void GCORE_TagSubsetInsert(GCORE_TagSubset *subset, char *tag)
+{
+	AVL_Insert(&subset->set, POLY_REF(tag));
+}
+
+void GCORE_IndexSubsetConstruct(GCORE_IndexSubset *indices, GCORE_ContainerDescriptor *descriptor, GCORE_TagSubset *tags)
+{
+	indices->count = AVL_Size(&tags->set);
+	indices->indices = malloc(indices->count * sizeof(int));
+	AVL_Iterator iter;
+	AVL_InitializeIterator(&tags->set, &iter);
+	for(int n = 0; AVL_Next(&iter); n++) indices->indices[n] = AVL_Get(&descriptor->map, AVL_Key(&iter));
+}
 
 int GCORE_ClipTriangles(double *buffin, int attributes, int statics, int count, double *buffout, int capacity)
 {
